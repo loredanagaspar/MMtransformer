@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+*.log
+
+# Jupyter/IPython
+.ipynb_checkpoints/
+
+# Environments
+env/
+venv/
+.venv/
+*.env
+*.env.*
+
+# PyTorch + HuggingFace cache
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.model
+*.h5
+.cache/
+datasets/
+wandb/
+
+# VS Code
+.vscode/
+
