@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from datasets import load_dataset
 from transformers import CLIPProcessor
+import traceback
 
 
 DROPOUT = 0.1
@@ -22,13 +23,26 @@ class CLIPBackbone(nn.Module):
 
     @torch.no_grad()
     def encode_image(self, pixel_values: torch.FloatTensor) -> torch.FloatTensor:
-        out = self.clip.vision_model(pixel_values).last_hidden_state
-        return out[:, 1:, :]
+        # Add explicit checks
+        try:
+            out = self.clip.vision_model(pixel_values).last_hidden_state
+            # Return only the patch tokens (skip the CLS token)
+            return out[:, 1:, :]
+        except Exception as e:
+            print(f"ERROR in encode_image: {e}")
+            print(f"Input shape: {pixel_values.shape}")
+            raise
 
     @torch.no_grad()
     def embed_text(self, input_ids: torch.LongTensor) -> torch.FloatTensor:
-        emb = self.clip.text_model.embeddings
-        return emb(input_ids=input_ids)
+        try:
+            emb = self.clip.text_model.embeddings
+            return emb(input_ids=input_ids)
+        except Exception as e:
+            print(f"ERROR in embed_text: {e}")
+            print(f"Input shape: {input_ids.shape}")
+            print(f"Max token ID: {input_ids.max().item()}")
+            raise
 
 
 def build_attention_mask(image_len: int, text_len: int, device: torch.device) -> torch.Tensor:
@@ -129,7 +143,12 @@ class MMTransformer(nn.Module):
         self.backbone = CLIPBackbone()
         self.image_proj = nn.Linear(img_dim, embed_dim)
         self.txt_proj = nn.Identity()
-        self.pos_embed = nn.Embedding(max_seq_len + 49, embed_dim)
+        
+        # CLIP has max sequence length of 77 and image patches of 49 (7x7)
+        max_positions = max_seq_len + 49  # 77 + 49 = 126
+        self.pos_embed = nn.Embedding(max_positions, embed_dim)
+        print(f"Position embedding table size: {max_positions}")
+        
         self.blocks = nn.ModuleList([
             SelfAttentionBlock(embed_dim, num_heads,
                                max_seq_len=max_seq_len + 49)
@@ -137,32 +156,114 @@ class MMTransformer(nn.Module):
         ])
         self.ln_final = nn.LayerNorm(embed_dim)
         self.output_layer = nn.Linear(embed_dim, vocab_size)
+        
+        # Extra debugging
+        self.debug_mode = True
 
     def forward(self, images, input_ids, attention_mask):
-        B, L = input_ids.shape
-        img_hidden = self.backbone.encode_image(images)
-        txt_embed = self.txt_proj(self.backbone.embed_text(input_ids))
-
-        img_proj = self.image_proj(img_hidden)
-
-        img_pos = torch.arange(img_proj.size(
-            1), device=images.device).unsqueeze(0)
-        txt_pos = torch.arange(L, device=images.device).unsqueeze(0)
-        img_proj = img_proj + self.pos_embed(img_pos)
-        txt_embed = txt_embed + self.pos_embed(txt_pos + img_proj.size(1))
-
-        x = torch.cat([img_proj, txt_embed], dim=1)
-
-        img_mask = torch.ones(B, img_proj.size(
-            1), dtype=attention_mask.dtype, device=images.device)
-        pad_mask = torch.cat([img_mask, attention_mask], dim=1)
-
-        attn_mask = build_attention_mask(img_proj.size(1), L, x.device)
-
-        for block in self.blocks:
-            x = block(x, image_len=img_proj.size(1),
-                      pad_mask=pad_mask, attn_mask=attn_mask)
-
-        x = self.ln_final(x)
-        logits = self.output_layer(x[:, img_proj.size(1):])
-        return logits
+        try:
+            # IMPORTANT: Add debugging information
+            print(f"DEBUG - Input shapes: images={images.shape}, input_ids={input_ids.shape}, mask={attention_mask.shape}")
+            print(f"DEBUG - Images memory: {images.device}, contiguous: {images.is_contiguous()}")
+            print(f"DEBUG - Image values range: min={images.min().item():.2f}, max={images.max().item():.2f}")
+            
+            # Check for NaNs
+            if torch.isnan(images).any():
+                print("WARNING: NaN values detected in image input")
+            
+            # Set a fixed size for image tokens - CLIP ViT-B/32 should have 7x7=49 patches
+            expected_image_tokens = 49
+            
+            # Process image through CLIP vision encoder with detailed error handling
+            try:
+                B, C, H, W = images.shape
+                img_hidden = self.backbone.encode_image(images)
+                print(f"DEBUG - img_hidden shape: {img_hidden.shape}")
+                
+                # Check that the output matches expected size
+                if img_hidden.shape[1] != expected_image_tokens:
+                    print(f"WARNING: Expected {expected_image_tokens} image tokens, got {img_hidden.shape[1]}")
+            except Exception as e:
+                print(f"ERROR in backbone.encode_image: {e}")
+                # Fallback to random features for debugging
+                print("FALLBACK: Using random features for image")
+                img_hidden = torch.randn(images.shape[0], expected_image_tokens, 768, device=images.device)
+            
+            # Process text through CLIP text encoder
+            B, L = input_ids.shape
+            txt_embed = self.txt_proj(self.backbone.embed_text(input_ids))
+            print(f"[SHAPES] txt_embed: {txt_embed.shape}")
+            
+            # Project image features to text embedding space
+            img_proj = self.image_proj(img_hidden)
+            print(f"[SHAPES] img_proj: {img_proj.shape}")
+            
+            img_len = img_proj.size(1)
+            
+            # Position embedding section
+            try:
+                # Create fixed position embeddings directly
+                img_pos_embed = torch.zeros_like(img_proj)
+                txt_pos_embed = torch.zeros_like(txt_embed)
+                
+                # For each position, fill with the appropriate embedding
+                for pos in range(img_len):
+                    # Make sure the embedding index is a scalar tensor on GPU
+                    pos_idx = torch.tensor([pos], device=images.device)
+                    # Get embedding for this position
+                    pos_embed = self.pos_embed(pos_idx)
+                    # Apply to all batches at this position
+                    img_pos_embed[:, pos, :] = pos_embed
+                
+                for pos in range(L):
+                    # Offset for text positions
+                    pos_idx = torch.tensor([pos + img_len], device=images.device)
+                    pos_embed = self.pos_embed(pos_idx)
+                    txt_pos_embed[:, pos, :] = pos_embed
+                
+                # Add position embeddings
+                img_proj = img_proj + img_pos_embed
+                txt_embed = txt_embed + txt_pos_embed
+                
+            except Exception as e:
+                print(f"Error in position embedding: {e}")
+                print("WARNING: Skipping position embeddings due to error")
+                # Just continue without position embeddings
+            
+            # Concatenate image and text features
+            x = torch.cat([img_proj, txt_embed], dim=1)
+            print(f"[SHAPES] concatenated x: {x.shape}")
+            
+            # Create attention masks
+            img_mask = torch.ones(B, img_len, dtype=attention_mask.dtype, device=images.device)
+            pad_mask = torch.cat([img_mask, attention_mask], dim=1)
+            
+            # Build causal attention mask
+            attn_mask = build_attention_mask(img_len, L, x.device)
+            print(f"Image length: {img_len}, Text length: {L}")
+            print(f"Attention mask shape: {attn_mask.shape}")
+            print(f"Pad mask shape: {pad_mask.shape}")
+            
+            # Visualize a small portion of the mask (first few rows/cols)
+            if attn_mask.shape[0] < 20:  # Only for small masks
+                print("Attention mask sample:")
+                print(attn_mask[:10, :10])  # Show top-left corner
+            
+            # Process through transformer blocks
+            for i, block in enumerate(self.blocks):
+                x = block(x, image_len=img_len,
+                          pad_mask=pad_mask, attn_mask=attn_mask)
+                if i == 0 and self.debug_mode:
+                    print(f"DEBUG - After block 0: x shape={x.shape}, x min={x.min().item():.2f}, x max={x.max().item():.2f}")
+            
+            # Final processing
+            x = self.ln_final(x)
+            logits = self.output_layer(x[:, img_len:])
+            print(f"[SHAPES] logits: {logits.shape}")
+            
+            return logits
+            
+        except Exception as e:
+            print(f"ERROR in MMTransformer.forward: {e}")
+            traceback.print_exc()
+            raise

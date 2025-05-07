@@ -25,6 +25,7 @@ venv/
 .cache/
 datasets/
 wandb/
+sample_images/
 
 # VS Code
 .vscode/
