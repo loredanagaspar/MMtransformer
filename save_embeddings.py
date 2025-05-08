@@ -105,6 +105,7 @@ text_embeddings = []
 img_ids = []
 caption_data = []
 combined_embeddings = []
+sample_dicts=[]
 
 # Projection for image features [768 → 512]
 image_proj = torch.nn.Linear(768, 512).to(device)
@@ -116,7 +117,7 @@ def process_image(image):
     logger.debug(f"Image input shape: {inputs['pixel_values'].shape}")
     out = model.vision_model(**inputs)
     patches = out.last_hidden_state[:, 1:, :]  # remove CLS
-    processed_img = image_proj(patches).squeeze(0)  # [49, 512]
+    processed_img = image_proj(patches).squeeze(0).to(device)  # [49, 512]
     logger.debug(f"Processed image embedding shape: {processed_img.shape}")
     return processed_img
 
@@ -132,7 +133,7 @@ def process_caption(caption, pad_token_id):
     logger.debug(f"Original input IDs length: {len(input_ids)}")
     pad_len = MAX_SEQ_LEN - len(input_ids)
     input_ids += [pad_token_id] * pad_len
-    input_tensor = torch.tensor(input_ids).unsqueeze(0)
+    input_tensor = torch.tensor(input_ids).unsqueeze(0).to(device)
     logger.debug(f"Input tensor shape: {input_tensor.shape}")
     text_emb = model.text_model.embeddings(input_ids=input_tensor).squeeze(0)
     logger.debug(f"Processed text embedding shape: {text_emb.shape}")
@@ -169,11 +170,15 @@ for sample_idx, sample in enumerate(tqdm(dataset, desc="Processing")):
         validate_shape(img_emb, (49, 512), "Image")
         validate_shape(txt_emb, (77, 512), "Text")
 
-        combined = torch.cat([img_emb, txt_emb], dim=0)  # (126, 512)
-        validate_shape(combined, (126, 512), "Combined")
-
-        # Move to CPU for saving
-        combined_embeddings.append(combined.cpu())
+        
+        try:
+            combined = torch.cat([img_emb, txt_emb], dim=0)
+            validate_shape(combined, (126, 512), "Combined")
+            combined_embeddings.append(combined.cpu())
+        except ValueError as ve:
+            logger.error(f"Shape error on sample {sample_idx}: {ve}")
+            skipped_samples += 1
+            continue
         image_embeddings.append(img_emb.cpu())
         text_embeddings.append(txt_emb.cpu())
         img_ids.append(sample['img_id'])
